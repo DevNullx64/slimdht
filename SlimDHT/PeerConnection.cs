@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 
@@ -78,7 +79,7 @@ namespace SlimDHT
         /// <param name="connecthandler">The method used to obtain the connection.</param>
         /// <param name="input">The channel for reading requests.</param>
         /// <param name="maxparallel">The maximum number of parallel handlers</param>
-        private static async Task RunSingleConnection(PeerInfo self, PeerInfo remote, Func<Task<Stream>> connecthandler, IReadChannel<ConnectionRequest> input, int maxparallel)
+        private static async Task RunSingleConnection(PeerInfo self, PeerInfo remote, Func<Task<Stream>> connecthandler, IReadChannel<ConnectionRequest> input, int maxparallel, CancellationToken cancellationToken = default)
         {
             // Get the local handler for remote requests
             var remotehandler = Channels.RemoteRequests.Get();
@@ -114,8 +115,8 @@ namespace SlimDHT
 
                 log.Debug($"Peer connection running {self.Key}, {self.Address}");
 
-                using (var tp = new TaskPool<ConnectionRequest>(maxparallel, (t, ex) => log.Warn("Unexpected error handling request", ex)))
-                while (true)
+                using var tp = new TaskPool<ConnectionRequest>(maxparallel, (t, ex) => log.Warn("Unexpected error handling request", ex));
+                while (!cancellationToken.IsCancellationRequested)
                 {
                     log.Debug($"Peer connection is waiting for request ...");
 
@@ -143,11 +144,11 @@ namespace SlimDHT
 
                                     // Write a registration request to the broker
                                     await Channels.ConnectionBrokerRegistrations.Get().WriteAsync(
-                                        new ConnectionRegistrationRequest() 
-                                        { 
-                                            IsTerminate = false, 
-                                            UpdateRouting = true, 
-                                            Peer = remote 
+                                        new ConnectionRegistrationRequest()
+                                        {
+                                            IsTerminate = false,
+                                            UpdateRouting = true,
+                                            Peer = remote
                                         }
                                     );
 
@@ -160,7 +161,7 @@ namespace SlimDHT
                                     log.Debug($"Registering {p.Peers.Count} peers with the routing table ...");
                                     foreach (var peer in p.Peers)
                                         await routingrequests.AddPeerAsync(peer.Key, peer);
-                                    
+
                                     log.Debug($"Registered {p.Peers.Count} peers with the routing table");
                                 }
 

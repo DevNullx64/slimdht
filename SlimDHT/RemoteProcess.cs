@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 
@@ -20,7 +21,7 @@ namespace SlimDHT
         /// <param name="selfinfo">Description of the owning node</param>
         /// <param name="maxparallel">The maximum number of requests to handle in parallel</param>
         /// <returns>The async.</returns>
-        public static Task RunAsync(PeerInfo selfinfo, int maxparallel = 10)
+        public static Task RunAsync(PeerInfo selfinfo, CancellationToken cancellationToken, int maxparallel = 10)
         {
             return AutomationExtensions.RunTask(new
             {
@@ -48,14 +49,15 @@ namespace SlimDHT
                     }
                 };
 
-                using(var tp = new TaskPool<ConnectionRequest>(maxparallel, errorHandler))
-                while (true)
+                using var tp = new TaskPool<ConnectionRequest>(maxparallel, errorHandler);
+                while (!cancellationToken.IsCancellationRequested)
                 {
                     log.Debug("Remote handler is waiting for requests ...");
                     var req = await self.Requests.ReadAsync();
                     log.Debug($"Remote handler got a {req.Request.Operation} request ({req.RequestID})");
 
-                    await tp.Run(req, async () => {
+                    await tp.Run(req, async () =>
+                    {
                         log.Debug($"Remote handler is processing {req.Request.Operation} request ({req.RequestID})");
                         if (req.Key != null && req.EndPoint != null)
                         {

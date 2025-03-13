@@ -4,7 +4,7 @@ using System.Linq;
 using SlimDHT;
 using Xunit;
 
-namespace Unittest
+namespace SlimDHT.Test
 {
     public class RoutingTests
     {

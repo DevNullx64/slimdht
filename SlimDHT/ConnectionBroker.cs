@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 
@@ -127,7 +128,7 @@ namespace SlimDHT
         /// <param name="node">This nodes information</param>
         /// <param name="maxconnections">The maximum number of connections to allow</param>
         /// <returns>An awaitable task.</returns>
-        public static Task RunAsync(PeerInfo node, int maxconnections = 50)
+        public static Task RunAsync(PeerInfo node, CancellationToken cancellationToken, int maxconnections = 50)
         {
             // The primary table for finding peers
             var peers = new Dictionary<EndPoint, Tuple<Task, IWriteChannel<ConnectionRequest>>>();
@@ -152,7 +153,7 @@ namespace SlimDHT
                 {
 
                     log.Debug($"Broker is now running");
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
                         log.Debug($"Broker is waiting for requests ...");
                         var mreq = await MultiChannelAccess.ReadFromAnyAsync(

@@ -3,6 +3,7 @@ using CoCoL;
 using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
+using System.Threading;
 
 namespace SlimDHT
 {
@@ -22,7 +23,7 @@ namespace SlimDHT
         /// <returns>An awaitable task.</returns>
         /// <param name="self">The peer making the query.</param>
         /// <param name="endPoints">The end points to query.</param>
-        public static Task RunAsync(PeerInfo self, EndPoint[] endPoints)
+        public static Task RunAsync(PeerInfo self, EndPoint[] endPoints, CancellationToken cancellationToken)
         {
             if (self == null)
                 throw new ArgumentNullException(nameof(self));

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 namespace SlimDHT
@@ -141,9 +142,9 @@ namespace SlimDHT
         /// <param name="storesize">The size of the MRU store</param>
         /// <param name="maxage">The maximum amount of time items are stored</param>
         /// <param name="buffersize">The size of the forwarding buffer.</param>
-        public static Task RunAsync(PeerInfo selfinfo, int storesize, TimeSpan maxage, int buffersize = 10)
+        public static Task RunAsync(PeerInfo selfinfo, int storesize, TimeSpan maxage, CancellationToken cancellationToken, int buffersize = 10)
         {
-            var parent = RunMRUAsync(selfinfo, storesize, maxage, buffersize);
+            var parent = RunMRUAsync(selfinfo, storesize, maxage, buffersize, cancellationToken);
             return Task.WhenAll(
                 parent,
 
@@ -151,7 +152,7 @@ namespace SlimDHT
                     new { Request = Channels.MRURequests.ForWrite },
                     async self =>
                     {
-                        while (true)
+                        while (!cancellationToken.IsCancellationRequested)
                         {
                             // Sleep, but quit if the MRU stops
                             if (await Task.WhenAny(parent, Task.Delay(new TimeSpan(maxage.Ticks / 3))) == parent)
@@ -173,7 +174,7 @@ namespace SlimDHT
         /// <param name="storesize">The size of the MRU store</param>
         /// <param name="maxage">The maximum amount of time items are stored</param>
         /// <param name="buffersize">The size of the parallel processing buffer</param>
-        private static Task RunMRUAsync(PeerInfo selfinfo, int storesize, TimeSpan maxage, int buffersize)
+        private static Task RunMRUAsync(PeerInfo selfinfo, int storesize, TimeSpan maxage, int buffersize, CancellationToken cancellationToken)
         {
             var storechan = Channel.Create<MRUInternalStore>();
             return AutomationExtensions.RunTask(new
@@ -198,12 +199,12 @@ namespace SlimDHT
                     catch (Exception ex2) { log.Warn("Failed to forward error report", ex2); }
                 };
 
-                using (var tp = new TaskPool<MRURequest>(buffersize, errorHandler))
-                while (true)
+                using var tp = new TaskPool<MRURequest>(buffersize, errorHandler);
+                while (!cancellationToken.IsCancellationRequested)
                 {
                     log.Debug($"Store is waiting for requests ...");
                     var mreq = await MultiChannelAccess.ReadFromAnyAsync(
-                        self.Stats.RequestRead(), 
+                        self.Stats.RequestRead(),
                         self.Store.RequestRead(),
                         self.Request.RequestRead()
                     );
@@ -238,8 +239,8 @@ namespace SlimDHT
                         // they are *the* handling peer
 
                         //if (shouldBroadCast)
-                            //await tp.Run(new MRURequest() { }, () => BroadcastValueAsync(selfinfo, sreq));
-                            
+                        //await tp.Run(new MRURequest() { }, () => BroadcastValueAsync(selfinfo, sreq));
+
                         continue;
                     }
 
@@ -250,27 +251,27 @@ namespace SlimDHT
                         switch (req.Operation)
                         {
                             case MRUOperation.Add:
-                            {
-                                // Always store it in our cache    
-                                cache.Add(req.Key, req.Data);
-                                
-                                // Process long-term if needed
-                                await tp.Run(req, () => StoreLongTermAsync(selfinfo, self.Routing, storechan.AsWrite(), req.Key, req.Data));
+                                {
+                                    // Always store it in our cache    
+                                    cache.Add(req.Key, req.Data);
 
-                                // Respond that we completed
-                                await tp.Run(req, () => req.SendResponseAsync(req.Key, null));
-                                break;
-                            }
+                                    // Process long-term if needed
+                                    await tp.Run(req, () => StoreLongTermAsync(selfinfo, self.Routing, storechan.AsWrite(), req.Key, req.Data));
+
+                                    // Respond that we completed
+                                    await tp.Run(req, () => req.SendResponseAsync(req.Key, null));
+                                    break;
+                                }
 
                             case MRUOperation.Get:
-                            {
-                                var res = cache.TryGetValue(req.Key, out var data);
-                                if (!res)
-                                    res = store.TryGetValue(req.Key, out data);
-                                    
-                                await tp.Run(req, () => req.SendResponseAsync(req.Key, data, res));
-                                break;
-                            }
+                                {
+                                    var res = cache.TryGetValue(req.Key, out var data);
+                                    if (!res)
+                                        res = store.TryGetValue(req.Key, out data);
+
+                                    await tp.Run(req, () => req.SendResponseAsync(req.Key, data, res));
+                                    break;
+                                }
                             case MRUOperation.Expire:
                                 cache.ExpireOldItems();
                                 store.ExpireOldItems();

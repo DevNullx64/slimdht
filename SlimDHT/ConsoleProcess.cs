@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 
@@ -12,7 +13,7 @@ namespace SlimDHT
     /// </summary>
     public static class ConsoleProcess
     {
-        private static string HELPTEXT =
+        private static readonly string HELPTEXT =
 @"
 SlimDHT control panel.
 
@@ -53,7 +54,7 @@ DHT actions:
         /// Runs the console interface
         /// </summary>
         /// <returns>An awaitable task.</returns>
-        public static Task RunAsync()
+        public static Task RunAsync(CancellationToken cancellationToken = default)
         {
             // Set up a console forwarder process
             var consoleOut = Skeletons.CollectAsync(
@@ -86,18 +87,18 @@ DHT actions:
                 },
                 async self =>
                 {
-                    var peers = new List<Tuple<PeerInfo, Task, IWriteChannel<PeerRequest>>>();
+                    var peers = new List<(PeerInfo PeerInfo, Task Task, IWriteChannel<PeerRequest> PeerRequest)>();
                     var rnd = new Random();
 
                     var portnr = 15000;
 
                     await self.Output.WriteAsync(HELPTEXT);
-                    while (true)
+                    while (!cancellationToken.IsCancellationRequested)
                     {
                         try
                         {
                             var commandline = await self.Control.ReadAsync() ?? string.Empty;
-                            var command = commandline.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+                            var command = commandline.Split([' '], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
 
                             if (string.Equals(command, "help", StringComparison.OrdinalIgnoreCase))
                                 await self.Output.WriteAsync(HELPTEXT);
@@ -106,9 +107,9 @@ DHT actions:
                             else if (string.Equals(command, "check", StringComparison.OrdinalIgnoreCase))
                             {
                                 for (var i = peers.Count - 1; i >= 0; i--)
-                                    if (await peers[i].Item3.IsRetiredAsync)
+                                    if (await peers[i].PeerRequest.IsRetiredAsync)
                                     {
-                                        await self.Output.WriteAsync($"Peer {peers[i].Item1.Key} at {peers[i].Item1.Address} terminated");
+                                        await self.Output.WriteAsync($"Peer {peers[i].PeerInfo.Key} at {peers[i].PeerInfo.Address} terminated");
                                         peers.RemoveAt(i);
                                     }
 
@@ -116,7 +117,7 @@ DHT actions:
                             }
                             else if (string.Equals(command, "node", StringComparison.OrdinalIgnoreCase))
                             {
-                                var actions = commandline.Split(new char[] { ' ' }, 4, StringSplitOptions.RemoveEmptyEntries);
+                                var actions = commandline.Split([' '], 4, StringSplitOptions.RemoveEmptyEntries);
 
                                 if (string.Equals(actions[1], "start", StringComparison.OrdinalIgnoreCase))
                                 {
@@ -127,13 +128,14 @@ DHT actions:
                                     var s = Task.Run(() =>
                                                      Peer.RunPeer(
                                                          pi, 5, 100, TimeSpan.FromDays(1),
-                                                         peers.Count == 0 ? new EndPoint[0] : new[] { peers[rnd.Next(0, peers.Count - 1)].Item1.Address },
-                                                         chan.AsRead()
+                                                         peers.Count == 0 ? [] : [peers[rnd.Next(0, peers.Count - 1)].PeerInfo.Address],
+                                                         chan.AsRead(),
+                                                         cancellationToken
                                                      )
-                                                     .ContinueWith(_ => inputChannel.WriteAsync("check"))
+                                                     .ContinueWith(_ => self.Control.WriteAsync("check"))
                                                     );
 
-                                    peers.Add(new Tuple<PeerInfo, Task, IWriteChannel<PeerRequest>>(pi, s, chan));
+                                    peers.Add((pi, s, chan));
                                     portnr++;
                                 }
                                 else if (string.Equals(actions[1], "list", StringComparison.OrdinalIgnoreCase))
@@ -145,12 +147,12 @@ DHT actions:
                                     }
 
                                     for (var i = 0; i < peers.Count; i++)
-                                        await self.Output.WriteAsync(string.Format("{0}: {1} - {2}", i, peers[i].Item1.Key, peers[i].Item1.Address));
+                                        await self.Output.WriteAsync(string.Format("{0}: {1} - {2}", i, peers[i].PeerInfo.Key, peers[i].PeerInfo.Address));
                                     await self.Output.WriteAsync(string.Empty);
                                 }
                                 else if (string.Equals(actions[1], "connect", StringComparison.OrdinalIgnoreCase))
                                 {
-                                    actions = commandline.Split(new char[] { ' ' }, 5, StringSplitOptions.RemoveEmptyEntries);
+                                    actions = commandline.Split([' '], 5, StringSplitOptions.RemoveEmptyEntries);
                                     if (actions.Length != 4)
                                     {
                                         await self.Output.WriteAsync("The connect command needs exactly two arguments, the ip and the port");
@@ -176,13 +178,14 @@ DHT actions:
                                     var s = Task.Run(() =>
                                                           Peer.RunPeer(
                                                               pi, 5, 100, TimeSpan.FromDays(1),
-                                                              new[] { new IPEndPoint(ip, port) },
-                                                              chan.AsRead()
+                                                              [new IPEndPoint(ip, port)],
+                                                              chan.AsRead(),
+                                                              cancellationToken
                                                           )
-                                                          .ContinueWith(_ => inputChannel.WriteAsync("check"))
+                                                          .ContinueWith(_ => self.Control.WriteAsync("check"))
                                                          );
 
-                                    peers.Add(new Tuple<PeerInfo, Task, IWriteChannel<PeerRequest>>(pi, s, chan));
+                                    peers.Add((pi, s, chan));
                                     portnr++;
 
                                 }
@@ -208,16 +211,16 @@ DHT actions:
 
                                     if (string.Equals(actions[1], "stop", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        await self.Output.WriteAsync($"Stopping node {ix} ({peers[ix].Item1.Key} at {peers[ix].Item1.Address}) ...");
-                                        await peers[ix].Item3.RetireAsync();
-                                        await self.Output.WriteAsync($"Stopped node ({peers[ix].Item1.Key} at {peers[ix].Item1.Address}) ...");
+                                        await self.Output.WriteAsync($"Stopping node {ix} ({peers[ix].PeerInfo.Key} at {peers[ix].PeerInfo.Address}) ...");
+                                        await peers[ix].PeerRequest.RetireAsync();
+                                        await self.Output.WriteAsync($"Stopped node ({peers[ix].PeerInfo.Key} at {peers[ix].PeerInfo.Address}) ...");
                                         //peers.RemoveAt(ix);
                                     }
                                     else if (string.Equals(actions[1], "stat", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        await self.Output.WriteAsync($"Requesting stats from node {ix} ({peers[ix].Item1.Key} at {peers[ix].Item1.Address}) ...");
+                                        await self.Output.WriteAsync($"Requesting stats from node {ix} ({peers[ix].PeerInfo.Key} at {peers[ix].PeerInfo.Address}) ...");
                                         var channel = Channel.Create<PeerResponse>();
-                                        await peers[ix].Item3.WriteAsync(new PeerRequest()
+                                        await peers[ix].PeerRequest.WriteAsync(new PeerRequest()
                                         {
                                             Operation = PeerOperation.Stats,
                                             Response = channel
@@ -228,10 +231,10 @@ DHT actions:
                                     }
                                     else if (string.Equals(actions[1], "refresh", StringComparison.OrdinalIgnoreCase))
                                     {
-                                        await self.Output.WriteAsync($"Performing refresh on {ix} ({peers[ix].Item1.Key} at {peers[ix].Item1.Address}) ...");
+                                        await self.Output.WriteAsync($"Performing refresh on {ix} ({peers[ix].PeerInfo.Key} at {peers[ix].PeerInfo.Address}) ...");
 
                                         var channel = Channel.Create<PeerResponse>();
-                                        await peers[ix].Item3.WriteAsync(new PeerRequest()
+                                        await peers[ix].PeerRequest.WriteAsync(new PeerRequest()
                                         {
                                             Operation = PeerOperation.Refresh,
                                             Response = channel
@@ -252,7 +255,7 @@ DHT actions:
                             }
                             else if (string.Equals(command, "add", StringComparison.OrdinalIgnoreCase))
                             {
-                                var actions = commandline.Split(new char[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+                                var actions = commandline.Split([' '], 2, StringSplitOptions.RemoveEmptyEntries);
                                 if (actions.Length == 1)
                                 {
                                     await self.Output.WriteAsync("The add command needs the value to add");
@@ -269,7 +272,7 @@ DHT actions:
                                 var key = Key.ComputeKey(data);
 
                                 await self.Output.WriteAsync($"Adding {data.Length} byte(s) with key {key}");
-                                await peers[rnd.Next(0, peers.Count)].Item3.WriteAsync(new PeerRequest()
+                                await peers[rnd.Next(0, peers.Count)].PeerRequest.WriteAsync(new PeerRequest()
                                 {
                                     Operation = PeerOperation.Add,
                                     Key = key,
@@ -283,7 +286,7 @@ DHT actions:
                             }
                             else if (string.Equals(command, "get", StringComparison.OrdinalIgnoreCase))
                             {
-                                var actions = commandline.Split(new char[] { ' ' }, 3, StringSplitOptions.RemoveEmptyEntries);
+                                var actions = commandline.Split([' '], 3, StringSplitOptions.RemoveEmptyEntries);
                                 if (actions.Length == 1)
                                 {
                                     await self.Output.WriteAsync("The get command needs the hash to find");
@@ -312,7 +315,7 @@ DHT actions:
                                 var channel = Channel.Create<PeerResponse>();
 
                                 await self.Output.WriteAsync($"Locating key");
-                                await peers[rnd.Next(0, peers.Count)].Item3.WriteAsync(new PeerRequest()
+                                await peers[rnd.Next(0, peers.Count)].PeerRequest.WriteAsync(new PeerRequest()
                                 {
                                     Operation = PeerOperation.Find,
                                     Key = key,
@@ -327,7 +330,7 @@ DHT actions:
                             }
                             else if (string.Equals(command, "hash", StringComparison.OrdinalIgnoreCase))
                             {
-                                var actions = commandline.Split(new char[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+                                var actions = commandline.Split([' '], 2, StringSplitOptions.RemoveEmptyEntries);
                                 if (actions.Length == 1)
                                 {
                                     await self.Output.WriteAsync("The add command needs the value to add");

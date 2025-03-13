@@ -2,14 +2,14 @@ using System;
 using SlimDHT;
 using Xunit;
 
-namespace Unittest
+namespace SlimDHT.Test
 {
     public class KeyTests
     {
         [Fact]
         public void CreateKey()
         {
-			var key = SlimDHT.Key.CreateRandomKey();
+			var key = Key.CreateRandomKey();
         }
 
 		[Fact]

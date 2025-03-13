@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using CoCoL;
 
@@ -94,149 +95,148 @@ namespace SlimDHT
         /// <param name="maxage">The maximum age of items in the cache</param>
         /// <param name="initialContactlist">Initial list of peers to contact.</param>
         /// <param name="requests">The request channel for local management</param>
-        public static async Task RunPeer(PeerInfo selfinfo, int k, int storesize, TimeSpan maxage, EndPoint[] initialContactlist, IReadChannel<PeerRequest> requests)
+        public static async Task RunPeer(PeerInfo selfinfo, int k, int storesize, TimeSpan maxage, EndPoint[] initialContactlist, IReadChannel<PeerRequest> requests = null, CancellationToken cancellationToken = default)
         {
             try
             {
-                if (selfinfo == null)
-                    throw new ArgumentNullException(nameof(selfinfo));
-                if (initialContactlist == null)
-                    throw new ArgumentNullException(nameof(initialContactlist));
+                ArgumentNullException.ThrowIfNull(selfinfo);
+                ArgumentNullException.ThrowIfNull(initialContactlist);
+                requests ??= Channel.Create<PeerRequest>();
 
-                var ip = selfinfo.Address as IPEndPoint;
-                if (ip == null)
-                    throw new ArgumentException($"Unable to convert {nameof(selfinfo.Address)} to a {nameof(IPEndPoint)}", nameof(selfinfo));
 
+                IPEndPoint ip = selfinfo.Address as IPEndPoint
+                    ?? throw new ArgumentException($"Unable to convert {nameof(selfinfo.Address)} to a {nameof(IPEndPoint)}", nameof(selfinfo));
                 log.Debug($"Starting a peer with key {selfinfo.Key} and address {selfinfo.Address}");
 
-                using (var scope = new IsolatedChannelScope())
-                {
-                    var sock = new TcpListener(ip);
-                    sock.Start();
+                using var scope = new IsolatedChannelScope();
+                var sock = new TcpListener(ip);
+                sock.Start();
 
-                    // Set up the helper processes
-                    var router = RoutingProcess.RunAsync(selfinfo, k);
-                    var broker = ConnectionBroker.RunAsync(selfinfo);
-                    var values = MRUProcess.RunAsync(selfinfo, storesize, maxage);
-                    var remoter = RemoteProcess.RunAsync(selfinfo);
+                // Set up the helper processes
+                var router = RoutingProcess.RunAsync(selfinfo, k, cancellationToken);
+                var broker = ConnectionBroker.RunAsync(selfinfo, cancellationToken);
+                var values = MRUProcess.RunAsync(selfinfo, storesize, maxage, cancellationToken);
+                var remoter = RemoteProcess.RunAsync(selfinfo, cancellationToken);
 
-                    log.Debug("Started router, broker, and value store");
+                log.Debug("Started router, broker, and value store");
 
-                    // Handle new connections
-                    var listener = ListenAsync(selfinfo, sock);
+                // Handle new connections
+                var listener = ListenAsync(selfinfo, sock, cancellationToken);
 
-                    log.Debug("Started listener");
+                log.Debug("Started listener");
 
-                    // Start discovery of peers
-                    var discovery = DiscoveryProcess.RunAsync(selfinfo, initialContactlist);
+                // Start discovery of peers
+                var discovery = DiscoveryProcess.RunAsync(selfinfo, initialContactlist, cancellationToken);
 
-                    log.Debug("Started discovery");
+                log.Debug("Started discovery");
+                var discoveryListener = DiscoveryService.StartListeningAsync(selfinfo, cancellationToken);
 
-                    // The process handling requests to the local node
-                    var proc = AutomationExtensions.RunTask(
-                        new
+                // The process handling requests to the local node
+                var proc = AutomationExtensions.RunTask(
+                    new
+                    {
+                        Requests = requests,
+                        Refresh = Channels.PeerRequests.ForRead,
+
+                        // Add these, so this process terminates the others as well
+                        BrokerReg = Channels.ConnectionBrokerRegistrations.ForWrite,
+                        BrokerReq = Channels.ConnectionBrokerRequests.ForWrite,
+                        BrokerStat = Channels.ConnectionBrokerStats.ForWrite,
+                        MRUReq = Channels.MRURequests.ForWrite,
+                        MRUStat = Channels.MRUStats.ForWrite,
+                        RouteReq = Channels.RoutingTableRequests.ForWrite,
+                        RouteStat = Channels.RoutingTableStats.ForWrite,
+                    },
+                    async self =>
+                    {
+                        log.Debug("Running peer main loop");
+
+                        try
                         {
-                            Requests = requests,
-                            Refresh = Channels.PeerRequests.ForRead,
-
-                            // Add these, so this process terminates the others as well
-                            BrokerReg = Channels.ConnectionBrokerRegistrations.ForWrite,
-                            BrokerReq = Channels.ConnectionBrokerRequests.ForWrite,
-                            BrokerStat = Channels.ConnectionBrokerStats.ForWrite,
-                            MRUReq = Channels.MRURequests.ForWrite,
-                            MRUStat = Channels.MRUStats.ForWrite,
-                            RouteReq = Channels.RoutingTableRequests.ForWrite,
-                            RouteStat = Channels.RoutingTableStats.ForWrite,
-                        },
-                        async self =>
-                        {
-                            log.Debug("Running peer main loop");
-
-                            try
+                            while (!cancellationToken.IsCancellationRequested)
                             {
-                                while (true)
+                                cancellationToken.ThrowIfCancellationRequested();
+                                var req = (await MultiChannelAccess.ReadFromAnyAsync(self.Requests, self.Refresh)).Value;
+                                log.Debug($"Peer {selfinfo.Key} got message: {req.Operation}");
+                                switch (req.Operation)
                                 {
-                                    var req = (await MultiChannelAccess.ReadFromAnyAsync(self.Requests, self.Refresh)).Value;
-                                    log.Debug($"Peer {selfinfo.Key} got message: {req.Operation}");
-                                    switch (req.Operation)
-                                    {
-                                        case PeerOperation.Add:
-                                            await HandleAddOperation(selfinfo, req, k);
-                                            break;
-                                        case PeerOperation.Find:
-                                            await HandleFindOperation(selfinfo, req, k);
-                                            break;
-                                        case PeerOperation.Stats:
-                                            await HandleStatsOperation(req);
-                                            break;
-                                        case PeerOperation.Refresh:
-                                            await HandleRefreshOperation(selfinfo, req, k);
-                                            break;
-                                        default:
-                                            await req.Response.WriteAsync(new PeerResponse()
-                                            {
-                                                SuccessCount = -1
-                                            });
-                                            break;
-                                    }
-                                    log.Debug($"Peer {selfinfo.Key} handled message: {req.Operation}");
+                                    case PeerOperation.Add:
+                                        await HandleAddOperation(selfinfo, req, k);
+                                        break;
+                                    case PeerOperation.Find:
+                                        await HandleFindOperation(selfinfo, req, k);
+                                        break;
+                                    case PeerOperation.Stats:
+                                        await HandleStatsOperation(req);
+                                        break;
+                                    case PeerOperation.Refresh:
+                                        await HandleRefreshOperation(selfinfo, req, k);
+                                        break;
+                                    default:
+                                        await req.Response.WriteAsync(new PeerResponse()
+                                        {
+                                            SuccessCount = -1
+                                        });
+                                        break;
                                 }
-                            }
-                            catch (Exception ex)
-                            {
-                                if (!ex.IsRetiredException())
-                                    log.Warn($"Terminating peer {selfinfo.Key} due to error", ex);
-                                throw;
-                            }
-                            finally
-                            {
-                                log.Debug($"Terminating peer {selfinfo.Key}");
+                                log.Debug($"Peer {selfinfo.Key} handled message: {req.Operation}");
                             }
                         }
-                    );
-
-                    log.Debug("Started main handler");
-
-                    // Set up a process that periodically emits refresh operations
-                    var refresher = AutomationExtensions.RunTask(
-                        new { Control = Channels.PeerRequests.ForWrite },
-                        async self =>
+                        catch (OperationCanceledException)
                         {
-                            var respchan = Channel.Create<PeerResponse>();
-                            while (true)
-                            {
-                                // Sleep, but exit if the parent does
-                                if (await Task.WhenAny(Task.Delay(TimeSpan.FromMinutes(10)), proc) == proc)
-                                    return;
-                            
-                                await self.Control.WriteAsync(new PeerRequest()
-                                {
-                                    Operation = PeerOperation.Refresh,
-                                    Response = respchan
-                                });
-                                await respchan.ReadAsync();
-                            }
+                            log.Debug($"Peer {selfinfo.Key} operation cancelled");
                         }
-                    );
+                        catch (Exception ex)
+                        {
+                            if (!ex.IsRetiredException())
+                                log.Warn($"Terminating peer {selfinfo.Key} due to error", ex);
+                            throw;
+                        }
+                        finally
+                        {
+                            log.Debug($"Terminating peer {selfinfo.Key}");
+                        }
+                    }
+                );
 
-                    log.Debug("Started refresh process, peer is now live");
-                    await proc;
-                    await router;
-                    await broker;
-                    await values;
-                    await remoter;
-                    await discovery;
-                    await refresher;
+                log.Debug("Started main handler");
 
-                    await Task.WhenAll(router, broker, values, remoter, discovery, refresher);
-                }
+                // Set up a process that periodically emits refresh operations
+                var refresher = AutomationExtensions.RunTask(
+                    new { Control = Channels.PeerRequests.ForWrite },
+                    async self =>
+                    {
+                        var respchan = Channel.Create<PeerResponse>();
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            // Sleep, but exit if the parent does
+                            if (await Task.WhenAny(Task.Delay(TimeSpan.FromMinutes(10), cancellationToken), proc) == proc)
+                                return;
+
+                            await self.Control.WriteAsync(new PeerRequest()
+                            {
+                                Operation = PeerOperation.Refresh,
+                                Response = respchan
+                            });
+                            await respchan.ReadAsync();
+                        }
+                    }
+                );
+
+                log.Debug("Started refresh process, peer is now live");
+
+                await Task.WhenAll(router, broker, values, remoter, discovery, discoveryListener, refresher);
+            }
+            catch (OperationCanceledException)
+            {
+                log.Debug("Peer operation cancelled");
             }
             catch (Exception ex)
             {
                 log.Warn("Failed to start peer", ex);
 
                 try { await requests.RetireAsync(); }
-                catch(Exception ex2) { log.Warn("Failed to stop the input channel", ex2); }
+                catch (Exception ex2) { log.Warn("Failed to stop the input channel", ex2); }
 
                 log.Debug($"Peer with key {selfinfo.Key} and address {selfinfo.Address} stopped...");
 
@@ -250,15 +250,15 @@ namespace SlimDHT
         /// <returns>The async.</returns>
         /// <param name="selfinfo">Selfinfo.</param>
         /// <param name="sock">Sock.</param>
-        private static Task ListenAsync(PeerInfo selfinfo, TcpListener sock)
+        private static Task ListenAsync(PeerInfo selfinfo, TcpListener sock, CancellationToken cancellationToken)
         {
             // Set up a channel for sending sockets
             var sockchan = Channel.Create<TcpClient>();
             var listener = Task.Run(async () =>
             {
-                while (true)
+                while (!cancellationToken.IsCancellationRequested)
                     await sockchan.WriteAsync(await sock.AcceptTcpClientAsync());
-            });
+            }, cancellationToken);
 
             // Handle each request
             var handlers = Skeletons.CollectAsync(sockchan, async client => {
@@ -380,15 +380,14 @@ namespace SlimDHT
             using (var tp = new TaskPool<PeerInfo>(2, (p, ex) => log.Warn($"Request to peer {p.Key} - {p.Address} failed", ex)))
             while (success.Count < succes_count && (peers.Count + closest.Count > 0))
             {
-                peers = closest
+                peers = [.. closest
                     .Union(peers)
                     // Remove dead items
                     .Where(x => !used.Contains(x.Key))
                     // Always move closer to the target for find
                     .Where(x => closesttried == null || (new KeyDistance(key, x.Key).CompareTo(closesttried)) <= 0)
                     // Sort by distance 
-                    .OrderBy(x => new KeyDistance(key, x.Key))
-                    .ToList();
+                    .OrderBy(x => new KeyDistance(key, x.Key))];
 
                 // Clean the list
                 closest.Clear();

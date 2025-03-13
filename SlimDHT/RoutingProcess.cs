@@ -2,6 +2,7 @@
 using CoCoL;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Threading;
 
 namespace SlimDHT
 {
@@ -107,7 +108,8 @@ namespace SlimDHT
         /// <param name="owner">The owner of the routing table.</param>
         /// <param name="k">The redundancy parameter.</param>
         /// <param name="buffersize">The size of the forwarding buffer.</param>
-        public static Task RunAsync(PeerInfo owner, int k, int buffersize = 10)
+        /// <param name="cancellationToken">The cancellation token to cancel the operation.</param>
+        public static Task RunAsync(PeerInfo owner, int k, CancellationToken cancellationToken, int buffersize = 10)
         {
             return AutomationExtensions.RunTask(
                 new
@@ -128,18 +130,18 @@ namespace SlimDHT
                     Func<RoutingRequest, Exception, Task> errorHandler = async (t, ex) =>
                     {
                         log.Warn("Routing operation failed, sending failure response to requester", ex);
-                        try 
-                        { 
-                            await t.Response.WriteAsync(new RoutingResponse() { Exception = ex, Succes = false }); 
+                        try
+                        {
+                            await t.Response.WriteAsync(new RoutingResponse() { Exception = ex, Succes = false });
                         }
-                        catch (Exception ex2) 
-                        { 
-                            log.Warn("Failed to forward error message", ex2); 
+                        catch (Exception ex2)
+                        {
+                            log.Warn("Failed to forward error message", ex2);
                         }
                     };
 
-                    using(var tp = new TaskPool<RoutingRequest>(buffersize, errorHandler))
-                    while (true)
+                    using var tp = new TaskPool<RoutingRequest>(buffersize, errorHandler);
+                    while (!cancellationToken.IsCancellationRequested)
                     {
                         // Wait for requests
                         log.Debug($"Router is waiting for requests ...");
@@ -149,7 +151,8 @@ namespace SlimDHT
                             log.Debug($"Router got stat request");
 
                             var m = (IWriteChannel<RoutingStatsResponse>)r.Value;
-                            await m.WriteAsync(new RoutingStatsResponse() {
+                            await m.WriteAsync(new RoutingStatsResponse()
+                            {
                                 Count = table.Count,
                                 Stats = (Channels.RoutingTableRequests.Get() as ProfilingChannel<RoutingRequest>)?.ReportStats()
                             });
@@ -164,38 +167,38 @@ namespace SlimDHT
                             switch (data.Operation)
                             {
                                 case RoutingOperation.Add:
-                                {
-                                    var success = table.Add(data.Data, out var isNew);
-                                    if (data.Response != null)
-                                        await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = true, IsNew = isNew  }));
-
-                                    // If the peer is new, discover what peers it knows
-                                    if (isNew)
                                     {
-                                        log.Debug($"New peer, requesting refresh");
-                                        await tp.Run(data, () => self.PeerReq.WriteAsync(new PeerRequest()
-                                        {
-                                            Operation = PeerOperation.Refresh,
-                                            Key = data.Data.Key
-                                        }));
-                                        log.Debug($"Peer refresh requested");
-                                    }
+                                        var success = table.Add(data.Data, out var isNew);
+                                        if (data.Response != null)
+                                            await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = true, IsNew = isNew }));
 
-                                    break;
-                                }
+                                        // If the peer is new, discover what peers it knows
+                                        if (isNew)
+                                        {
+                                            log.Debug($"New peer, requesting refresh");
+                                            await tp.Run(data, () => self.PeerReq.WriteAsync(new PeerRequest()
+                                            {
+                                                Operation = PeerOperation.Refresh,
+                                                Key = data.Data.Key
+                                            }));
+                                            log.Debug($"Peer refresh requested");
+                                        }
+
+                                        break;
+                                    }
                                 case RoutingOperation.Remove:
-                                {
-                                    var sucess = table.RemoveKey(data.Key);
-                                    if (data.Response != null)
-                                        await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = sucess }));
-                                    break;
-                                }
+                                    {
+                                        var sucess = table.RemoveKey(data.Key);
+                                        if (data.Response != null)
+                                            await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = sucess }));
+                                        break;
+                                    }
                                 case RoutingOperation.Lookup:
-                                {
-                                    var peers = table.Nearest(data.Key, k, data.OnlyKBucket);
-                                    await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = true, Peers = peers }));
-                                    break;
-                                }
+                                    {
+                                        var peers = table.Nearest(data.Key, k, data.OnlyKBucket);
+                                        await tp.Run(data, () => data.Response.WriteAsync(new RoutingResponse() { Succes = true, Peers = peers }));
+                                        break;
+                                    }
                                 default:
                                     throw new Exception($"Operation not supported: {data.Operation}");
                             }
@@ -205,7 +208,7 @@ namespace SlimDHT
                             await errorHandler(data, ex);
                         }
                     }
-                });                
+                });
         }
     }
 }
